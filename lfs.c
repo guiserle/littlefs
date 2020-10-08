@@ -333,6 +333,11 @@ struct lfs_diskoff {
     lfs_off_t off;
 };
 
+struct truncate_info {
+  lfs_t* lfs;
+  lfs_block_t new_head;
+} truncate_info;
+
 #define LFS_MKATTRS(...) \
     (struct lfs_mattr[]){__VA_ARGS__}, \
     sizeof((struct lfs_mattr[]){__VA_ARGS__}) / sizeof(struct lfs_mattr)
@@ -446,6 +451,7 @@ static int lfs_alloc_lookahead(void *p, lfs_block_t block) {
             + lfs->cfg->block_count) % lfs->cfg->block_count;
 
     if (off < lfs->free.size) {
+        lfs->fs_size++;
         lfs->free.buffer[off / 32] |= 1U << (off % 32);
     }
 
@@ -454,15 +460,43 @@ static int lfs_alloc_lookahead(void *p, lfs_block_t block) {
 
 static void lfs_alloc_ack(lfs_t *lfs) {
     lfs->free.ack = lfs->cfg->block_count;
+    lfs->free.ack2 = 1;
 }
 
 // Invalidate the lookahead buffer. This is done during mounting and
 // failed traversals
 static void lfs_alloc_reset(lfs_t *lfs) {
-    lfs->free.off = lfs->seed % lfs->cfg->block_size;
+    lfs->free.off = lfs->seed % lfs->cfg->block_count;
     lfs->free.size = 0;
     lfs->free.i = 0;
     lfs_alloc_ack(lfs);
+}
+
+static int lfs_free_lookahead(void *p, lfs_block_t block) {
+  lfs_t *lfs = (lfs_t*)p;
+  lfs_block_t off = ((block - lfs->free.off)
+                     + lfs->cfg->block_count) % lfs->cfg->block_count;
+
+  if (off < lfs->free.size) {
+    LFS_ASSERT(lfs->free.buffer[off / 32] & (1U << (off % 32)));
+    lfs->free.buffer[off / 32] &= ~(1U << (off % 32));
+    lfs->fs_size--;
+  }
+
+  return 0;
+}
+
+static int lfs_truncate_free_lookahead(void *p, lfs_block_t block) {
+  struct truncate_info *info = (struct truncate_info*)p;
+  lfs_t *lfs = info->lfs;
+
+  if( block != info->new_head){
+    lfs_free_lookahead(lfs, block);
+  } else {
+    return block;
+  }
+
+  return 0;
 }
 
 static int lfs_alloc(lfs_t *lfs, lfs_block_t *block) {
@@ -475,6 +509,10 @@ static int lfs_alloc(lfs_t *lfs, lfs_block_t *block) {
             if (!(lfs->free.buffer[off / 32] & (1U << (off % 32)))) {
                 // found a free block
                 *block = (lfs->free.off + off) % lfs->cfg->block_count;
+                if (lfs->cfg->lookahead_size*8 >= lfs->cfg->block_count) {
+                  lfs->free.buffer[off / 32] |= 1U << (off % 32);
+                  lfs->fs_size++;
+                }
 
                 // eagerly find next off so an alloc ack can
                 // discredit old lookahead blocks
@@ -491,9 +529,24 @@ static int lfs_alloc(lfs_t *lfs, lfs_block_t *block) {
 
         // check if we have looked at all blocks since last ack
         if (lfs->free.ack == 0) {
-            LFS_ERROR("No more free space %"PRIu32,
-                    lfs->free.i + lfs->free.off);
-            return LFS_ERR_NOSPC;
+          if (lfs->cfg->lookahead_size * 8 >= lfs->cfg->block_count) {
+            if (lfs->free.ack2 != 0) {
+              lfs->free.ack2--;
+              // Fallback to slower lookahead scan if no more blocks were found
+              // on lookahead kept up to date. This may find blocks discarded
+              // for wear leveling
+              memset(lfs->free.buffer, 0, lfs->cfg->lookahead_size);
+              lfs->fs_size = 0;
+              int err = lfs_fs_traverseraw(lfs, lfs_alloc_lookahead, lfs, true);
+              if (err) {
+                lfs_alloc_reset(lfs);
+                return err;
+              }
+              continue;
+            }
+          }
+          LFS_ERROR("No more free space %" PRIu32, lfs->free.i + lfs->free.off);
+          return LFS_ERR_NOSPC;
         }
 
         lfs->free.off = (lfs->free.off + lfs->free.size)
@@ -502,12 +555,18 @@ static int lfs_alloc(lfs_t *lfs, lfs_block_t *block) {
         lfs->free.i = 0;
 
         // find mask of free blocks from tree
+      if (lfs->cfg->lookahead_size*8 >= lfs->cfg->block_count) {
+        // If lookeahead buffer is big enough, we try to keep it up to date on
+        // block deallocation, so no need for reset the buffer content
+        lfs->free.i = 0;
+      } else {
         memset(lfs->free.buffer, 0, lfs->cfg->lookahead_size);
         int err = lfs_fs_traverseraw(lfs, lfs_alloc_lookahead, lfs, true);
         if (err) {
-            lfs_alloc_reset(lfs);
-            return err;
+          lfs_alloc_reset(lfs);
+          return err;
         }
+      }
     }
 }
 
@@ -1407,6 +1466,12 @@ static int lfs_dir_drop(lfs_t *lfs, lfs_mdir_t *dir, lfs_mdir_t *tail) {
         return err;
     }
 
+  if (lfs->cfg->lookahead_size*8 >= lfs->cfg->block_count) {
+    for(uint32_t i = 0 ; i < 2 ; i++){
+      lfs_free_lookahead(lfs, tail->pair[i]);
+    }
+  }
+
     return 0;
 }
 
@@ -1693,6 +1758,8 @@ relocate:
         }
 
         // relocate half of pair
+        // We don't free dir->pair[1] here. Let's keep this heavily used block
+        // unused until next reset or all other blocks are used
         int err = lfs_alloc(lfs, &dir->pair[1]);
         if (err && (err != LFS_ERR_NOSPC || !tired)) {
             return err;
@@ -2627,6 +2694,10 @@ static int lfs_file_relocate(lfs_t *lfs, lfs_file_t *file) {
         file->cache.size = lfs->pcache.size;
         lfs_cache_zero(lfs, &lfs->pcache);
 
+        // Do not free block here, but on caller function. Currently this is
+        // called in 3 places, two of them related to bad blocks which we don't
+        // want to free and the other is on file outline, which means no block
+        // was allocated before
         file->block = nblock;
         file->flags |= LFS_F_WRITING;
         return 0;
@@ -2718,7 +2789,7 @@ relocate:
         } else {
             file->pos = lfs_max(file->pos, file->ctz.size);
         }
-
+        // We probably don't want to free any block as this is a bad block
         // actual file updates
         file->ctz.head = file->block;
         file->ctz.size = file->pos;
@@ -3063,10 +3134,19 @@ int lfs_file_truncate(lfs_t *lfs, lfs_file_t *file, lfs_off_t size) {
             LFS_TRACE("lfs_file_truncate -> %d", err);
             return err;
         }
-
+        lfs_block_t old_head = file->ctz.head;
+        lfs_size_t old_size = file->ctz.size;
         file->ctz.head = file->block;
         file->ctz.size = size;
         file->flags |= LFS_F_DIRTY | LFS_F_READING;
+        if (lfs->cfg->lookahead_size*8 >= lfs->cfg->block_count) {
+            err = lfs_ctz_traverse(lfs, NULL, &lfs->rcache, old_head, old_size,
+                                   lfs_truncate_free_lookahead,
+                                   &(struct truncate_info){lfs, file->ctz.head});
+            if (err != file->ctz.head) {
+              return err;
+            }
+          }
     } else if (size > oldsize) {
         // flush+seek if not already at end
         if (file->pos != oldsize) {
@@ -3156,6 +3236,7 @@ int lfs_remove(lfs_t *lfs, const char *path) {
         LFS_TRACE("lfs_remove -> %d", err);
         return err;
     }
+    const char* orig_path = path;
 
     lfs_mdir_t cwd;
     lfs_stag_t tag = lfs_dir_find(lfs, &cwd, &path, NULL);
@@ -3196,6 +3277,28 @@ int lfs_remove(lfs_t *lfs, const char *path) {
         dir.type = 0;
         dir.id = 0;
         lfs->mlist = &dir;
+    } else if(lfs_tag_type3(tag) == LFS_TYPE_REG){
+      if (lfs->cfg->lookahead_size*8 >= lfs->cfg->block_count) {
+        lfs_file_t file;
+        lfs_stag_t tag2 = lfs_dir_find(lfs, &file.m, &orig_path, &file.id);
+        if (tag2 < 0 && !(tag2 == LFS_ERR_NOENT && file.id != 0x3ff)) {
+          return tag2;
+        }
+        lfs_stag_t tag3 =
+            lfs_dir_get(lfs, &file.m, LFS_MKTAG(0x700, 0x3ff, 0),
+                        LFS_MKTAG(LFS_TYPE_STRUCT, file.id, 8), &file.ctz);
+        if (tag3 < 0) {
+          return tag3;
+        }
+        if (lfs_tag_type3(tag3) != LFS_TYPE_INLINESTRUCT) {
+          lfs_ctz_fromle32(&file.ctz);
+          int err = lfs_ctz_traverse(lfs, NULL, &lfs->rcache, file.ctz.head,
+                                     file.ctz.size, lfs_free_lookahead, lfs);
+          if (err) {
+            return err;
+          }
+        }
+      }
     }
 
     // delete the entry
@@ -3800,6 +3903,15 @@ int lfs_mount(lfs_t *lfs, const struct lfs_config *cfg) {
     // setup free lookahead
     lfs_alloc_reset(lfs);
 
+    if (lfs->cfg->lookahead_size*8 >= lfs->cfg->block_count) {
+      lfs->fs_size = 0;
+      lfs->free.size = lfs->cfg->block_count;
+      err = lfs_fs_traverseraw(lfs, lfs_alloc_lookahead, lfs, true);
+      if (err) {
+        goto cleanup;
+      }
+    }
+
     LFS_TRACE("lfs_mount -> %d", 0);
     return 0;
 
@@ -4002,6 +4114,7 @@ static lfs_stag_t lfs_fs_parent(lfs_t *lfs, const lfs_block_t pair[2],
 
 static int lfs_fs_relocate(lfs_t *lfs,
         const lfs_block_t oldpair[2], lfs_block_t newpair[2]) {
+    // Do not free blocks as this function is only called if block was corrupted
     // update internal root
     if (lfs_pair_cmp(oldpair, lfs->root) == 0) {
         lfs->root[0] = newpair[0];
@@ -4236,16 +4349,23 @@ static int lfs_fs_size_count(void *p, lfs_block_t block) {
 }
 
 lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
-    LFS_TRACE("lfs_fs_size(%p)", (void*)lfs);
-    lfs_size_t size = 0;
-    int err = lfs_fs_traverseraw(lfs, lfs_fs_size_count, &size, false);
-    if (err) {
-        LFS_TRACE("lfs_fs_size -> %d", err);
-        return err;
-    }
+  LFS_TRACE("lfs_fs_size(%p)", (void *)lfs);
+  lfs_ssize_t size = 0;
 
+  // If lookahead buffer is big enough, we don't need to traverse over FS
+  if (lfs->cfg->lookahead_size*8 >= lfs->cfg->block_count) {
+    return lfs->fs_size;
+  }
+
+  // Otherwise fallback to traverse implementation
+  int err = lfs_fs_traverseraw(lfs, lfs_fs_size_count, &size, false);
+  if (err) {
     LFS_TRACE("lfs_fs_size -> %d", err);
-    return size;
+    return err;
+  }
+
+  LFS_TRACE("lfs_fs_size -> %d", err);
+  return size;
 }
 
 #ifdef LFS_MIGRATE

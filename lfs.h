@@ -383,6 +383,7 @@ typedef struct lfs {
         lfs_block_t size;
         lfs_block_t i;
         lfs_block_t ack;
+        lfs_block_t ack2;
         uint32_t *buffer;
     } free;
 
@@ -390,6 +391,8 @@ typedef struct lfs {
     lfs_size_t name_max;
     lfs_size_t file_max;
     lfs_size_t attr_max;
+
+    lfs_size_t fs_size;
 
 #ifdef LFS_MIGRATE
     struct lfs1 *lfs1;
